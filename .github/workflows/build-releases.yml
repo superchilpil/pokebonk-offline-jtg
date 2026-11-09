@@ -32,8 +32,99 @@ jobs:
       ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
       ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
-  release:
+  windows-installer:
     needs: build
+    if: needs.build.outputs.changed == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: desktop-win32-x64
+          path: artifacts/desktop-win32-x64
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: game
+          path: artifacts/game
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+      - name: Create Windows installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = Get-Content 'artifacts/game/offline-build.json' -Raw | ConvertFrom-Json
+          $version = [string]$metadata.offlineVersion
+          if ([string]::IsNullOrWhiteSpace($version)) { throw 'offlineVersion is missing from offline-build.json' }
+
+          $archive = Get-ChildItem 'artifacts/desktop-win32-x64' -Filter '*.zip' | Select-Object -First 1
+          if ($null -eq $archive) { throw 'The Windows desktop package ZIP was not found.' }
+
+          New-Item -ItemType Directory -Force -Path 'staging','installer-output' | Out-Null
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath 'staging' -Force
+          $appDirectory = Get-ChildItem 'staging' -Directory | Select-Object -First 1
+          if ($null -eq $appDirectory) { throw 'The packaged Electron application directory was not found.' }
+
+          $appExe = Join-Path $appDirectory.FullName 'Pokebonk Offline.exe'
+          if (-not (Test-Path -LiteralPath $appExe)) { throw "Packaged application executable not found: $appExe" }
+
+          $iss = @"
+          [Setup]
+          AppId={{7A3C98F1-1B8D-4D4E-9C3A-7D2B0C0A9E51}
+          AppName=PokéBonk Offline
+          AppVersion=$version
+          AppPublisher=PokéBonk Offline
+          DefaultDirName={autopf}\PokéBonk Offline
+          DefaultGroupName=PokéBonk Offline
+          ArchitecturesAllowed=x64
+          ArchitecturesInstallIn64BitMode=x64
+          OutputDir=installer-output
+          OutputBaseFilename=Pokebonk-Offline-Setup-$version
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          UninstallDisplayIcon={app}\Pokebonk Offline.exe
+          PrivilegesRequired=admin
+          SetupLogging=yes
+
+          [Languages]
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+
+          [Files]
+          Source: "$($appDirectory.FullName)\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\PokéBonk Offline"; Filename: "{app}\Pokebonk Offline.exe"
+          Name: "{autodesktop}\PokéBonk Offline"; Filename: "{app}\Pokebonk Offline.exe"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\Pokebonk Offline.exe"; Description: "Launch PokéBonk Offline"; Flags: nowait postinstall skipifsilent
+          "@
+          Set-Content -Path 'installer.iss' -Value $iss -Encoding UTF8
+
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $compiler)) { throw "Inno Setup compiler not found: $compiler" }
+          & $compiler 'installer.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+
+          $setup = Get-ChildItem 'installer-output' -Filter '*.exe' | Select-Object -First 1
+          if ($null -eq $setup -or $setup.Length -le 0) { throw 'Installer EXE was not created.' }
+          Write-Host "Created installer: $($setup.FullName)"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-installer
+          path: installer-output/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [build, windows-installer]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.build.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -55,8 +146,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir release
-          cp artifacts/desktop-*/* artifacts/android/*.apk release/
-          test "$(find release -type f | wc -l)" -eq 5
+          cp artifacts/desktop-*/* artifacts/android/*.apk artifacts/windows-installer/*.exe release/
+          test "$(find release -type f | wc -l)" -eq 6
           node scripts/release-notes.ts artifacts/game/offline-build.json notes.md release/release-info.json
           (cd release && sha256sum * > SHA256SUMS.txt && sha256sum --check SHA256SUMS.txt)
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft > existing.txt 2>/dev/null; then
@@ -65,5 +156,5 @@ jobs:
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "$TITLE" --notes-file notes.md release/*
           fi
-          test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')" -eq 7
+          test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')" -eq 8
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
