@@ -1,0 +1,124 @@
+name: Build Windows installer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'desktop/**'
+      - 'runtime/**'
+      - 'scripts/**'
+      - 'types/**'
+      - 'vendor/pokebonk/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'tsconfig*.json'
+      - 'LICENSE'
+      - '.github/workflows/build-windows-installer.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+        with:
+          version: 10.33.2
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install Electron runtime
+        run: pnpm exec install-electron
+      - name: Validate source
+        run: |
+          pnpm typecheck
+          pnpm test:types
+          pnpm test
+      - name: Prepare and verify offline game
+        run: |
+          pnpm prepare:game
+          node scripts/verify-game.ts
+      - name: Package Windows application
+        run: pnpm package:electron build/game release win32 x64
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+      - name: Create Windows installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = Get-Content 'build/game/offline-build.json' -Raw | ConvertFrom-Json
+          $version = [string]$metadata.offlineVersion
+          if ([string]::IsNullOrWhiteSpace($version)) { throw 'offlineVersion is missing from offline-build.json' }
+
+          $archive = Get-ChildItem 'release' -Filter '*.zip' | Select-Object -First 1
+          if ($null -eq $archive) { throw 'The Windows desktop package ZIP was not found.' }
+
+          New-Item -ItemType Directory -Force -Path 'staging','installer-output' | Out-Null
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath 'staging' -Force
+          $appDirectory = Get-ChildItem 'staging' -Directory | Select-Object -First 1
+          if ($null -eq $appDirectory) { throw 'The packaged Electron application directory was not found.' }
+
+          $appExe = Join-Path $appDirectory.FullName 'Pokebonk Offline.exe'
+          if (-not (Test-Path -LiteralPath $appExe)) { throw "Packaged application executable not found: $appExe" }
+
+          $iss = @"
+          [Setup]
+          AppId={{7A3C98F1-1B8D-4D4E-9C3A-7D2B0C0A9E51}
+          AppName=PokéBonk Offline
+          AppVersion=$version
+          AppPublisher=PokéBonk Offline
+          DefaultDirName={autopf}\PokéBonk Offline
+          DefaultGroupName=PokéBonk Offline
+          ArchitecturesAllowed=x64
+          ArchitecturesInstallIn64BitMode=x64
+          OutputDir=installer-output
+          OutputBaseFilename=Pokebonk-Offline-Setup-$version
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          UninstallDisplayIcon={app}\Pokebonk Offline.exe
+          PrivilegesRequired=admin
+          SetupLogging=yes
+
+          [Languages]
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+
+          [Files]
+          Source: "$($appDirectory.FullName)\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\PokéBonk Offline"; Filename: "{app}\Pokebonk Offline.exe"
+          Name: "{autodesktop}\PokéBonk Offline"; Filename: "{app}\Pokebonk Offline.exe"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\Pokebonk Offline.exe"; Description: "Launch PokéBonk Offline"; Flags: nowait postinstall skipifsilent
+          "@
+          Set-Content -Path 'installer.iss' -Value $iss -Encoding UTF8
+
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $compiler)) { throw "Inno Setup compiler not found: $compiler" }
+          & $compiler 'installer.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+
+          $setup = Get-ChildItem 'installer-output' -Filter '*.exe' | Select-Object -First 1
+          if ($null -eq $setup -or $setup.Length -le 0) { throw 'Installer EXE was not created.' }
+          Write-Host "Created installer: $($setup.FullName)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pokebonk-windows-installer
+          path: installer-output/*.exe
+          if-no-files-found: error
+          retention-days: 14
